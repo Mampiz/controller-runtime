@@ -302,27 +302,98 @@ var _ = Describe("runnableGroup", func() {
 		defer cancel()
 		rg := newRunnableGroup(defaultBaseContext, errCh)
 
-		go func() {
-			defer GinkgoRecover()
-			<-time.After(50 * time.Millisecond)
-			Expect(rg.Start(ctx)).To(Succeed())
-		}()
-
 		for i := range 20 {
-			go func(i int) {
-				defer GinkgoRecover()
-
-				Expect(rg.Add(RunnableFunc(func(c context.Context) error {
-					<-ctx.Done()
-					return nil
-				}), func(_ context.Context) bool {
-					<-time.After(time.Duration(i) * 10 * time.Millisecond)
-					return i%2 == 0 // Return false readiness all uneven indexes.
-				})).To(Succeed())
-			}(i)
+			Expect(rg.Add(RunnableFunc(func(c context.Context) error {
+				<-ctx.Done()
+				return nil
+			}), func(_ context.Context) bool {
+				<-time.After(time.Duration(i) * 10 * time.Millisecond)
+				return i%2 == 0 // Return false readiness all uneven indexes.
+			})).To(Succeed())
 		}
+
+		Expect(rg.Start(ctx)).To(MatchError(context.DeadlineExceeded))
 	})
 })
+
+func TestStartReturnsWhenContextIsDoneBeforeRunnablesAreReady(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// ctx returns the context passed to Start.
+		ctx func(t *testing.T) context.Context
+		// readyAfterStart makes the readiness check succeed after Start has returned.
+		readyAfterStart bool
+		wantErr         error
+	}{
+		{
+			name: "cancelled context and readiness check fails",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+		},
+		{
+			name: "cancelled context and readiness check succeeds after Start returned",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			readyAfterStart: true,
+		},
+		{
+			name: "context deadline exceeded",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				t.Cleanup(cancel)
+				return ctx
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				g := NewWithT(t)
+				ready := make(chan struct{})
+
+				rg := newRunnableGroup(defaultBaseContext, make(chan error))
+				g.Expect(rg.Add(RunnableFunc(func(ctx context.Context) error {
+					<-ctx.Done()
+					return nil
+				}), func(ctx context.Context) bool {
+					select {
+					case <-ready:
+						return true
+					case <-ctx.Done():
+						return false
+					}
+				})).To(Succeed())
+
+				err := rg.Start(tc.ctx(t))
+				if tc.wantErr != nil {
+					g.Expect(err).To(MatchError(tc.wantErr))
+				} else {
+					g.Expect(err).ToNot(HaveOccurred())
+				}
+
+				// A readiness check that succeeds after Start returned must
+				// neither panic nor block forever. synctest.Test fails if any
+				// goroutine is still blocked once StopAndWait returns.
+				if tc.readyAfterStart {
+					close(ready)
+					synctest.Wait()
+				}
+				rg.StopAndWait(t.Context())
+			})
+		})
+	}
+}
 
 var _ warmupRunnable = &warmupRunnableFunc{}
 

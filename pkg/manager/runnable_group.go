@@ -183,8 +183,6 @@ func (r *runnableGroup) Start(ctx context.Context) error {
 	var retErr error
 
 	r.startOnce.Do(func() {
-		defer close(r.startReadyCh)
-
 		// Start the internal reconciler.
 		go r.reconcile()
 
@@ -207,9 +205,12 @@ func (r *runnableGroup) Start(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
+				// Stop waiting, otherwise a readiness check that never succeeds
+				// would block startup, and with it the shutdown, forever.
 				if err := ctx.Err(); !errors.Is(err, context.Canceled) {
 					retErr = err
 				}
+				return
 			case rn := <-r.startReadyCh:
 				for i, existing := range r.startQueue {
 					if existing == rn {
@@ -261,7 +262,12 @@ func (r *runnableGroup) reconcile() {
 			go func() {
 				if rn.Check(r.ctx) {
 					if rn.signalReady {
-						r.startReadyCh <- rn
+						// Start might have stopped waiting for readiness signals
+						// because its context is done, don't block forever then.
+						select {
+						case r.startReadyCh <- rn:
+						case <-r.ctx.Done():
+						}
 					}
 				}
 			}()
